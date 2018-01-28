@@ -224,8 +224,11 @@ def test_model(in_model, in_test_sqa, in_batches):
         test_labels
     )
     test_probas = in_model.predict_proba(s_test, q_test)
-    print('=----save probs')
+    print('-----save probs')
     np.save(args.model_set + '-probas', test_probas)
+    test_results = in_model.predict(s_test, q_test)
+    print('-----save before-probs')
+    np.save(args.model_set + '-results', test_results)
 
     logger.info('-----------------------')
     # logger.info('Total Cost:\t{}'.format(total_cost))
@@ -305,7 +308,8 @@ def main():
             session=sess,
             hops=FLAGS.hops,
             max_grad_norm=FLAGS.max_grad_norm,
-            optimizer=optimizer
+            optimizer=optimizer,
+            model_set=args.model_set
         )
         if args.test == 0:
             best_accuracy_per_epoch = train_model(

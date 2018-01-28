@@ -5,6 +5,7 @@ The implementation is based on http://arxiv.org/abs/1503.08895 [1]
 from __future__ import absolute_import
 from __future__ import division
 
+import os
 import tensorflow as tf
 import numpy as np
 from six.moves import range
@@ -66,6 +67,7 @@ class MemN2N(object):
         nonlin=None,
         initializer=tf.random_normal_initializer(stddev=0.1),
         optimizer=tf.train.AdamOptimizer(learning_rate=1e-2),
+        model_set=None,
         encoding=position_encoding,
         session=tf.Session(),
         name='MemN2N'):
@@ -114,6 +116,7 @@ class MemN2N(object):
         self._nonlin = nonlin
         self._init = initializer
         self._opt = optimizer
+        self._model_set = model_set
         self._name = name
         self._answers_one_hot = tf.pack(answers, name='answers_one_hot')
         self._answer_vocab_size = self._answers_one_hot.get_shape()[0].value
@@ -186,14 +189,12 @@ class MemN2N(object):
             self.W = tf.Variable(self._init([self._answer_vocab_size, self._embedding_size]), name="W")
 
             self.saver = tf.train.Saver()
-            # if tf.train.get_checkpoint_state('./ckpt/'):
-            #     self.restore_model = True
-            #     print('============found checkpoints. Load saved model!')
-            #     ckpt = tf.train.get_checkpoint_state('./ckpt/')
-            #     last_model = ckpt.model_checkpoint_path
-            #     self.saver.restore(self._sess, last_model)
-            # else:
-            #     print('============no checkpoints')
+            if self._model_set and os.path.isfile('./ckpt/' + self._model_set + '.ckpt.index'):
+                self.restore_model = True
+                print('============load', './ckpt/' + self._model_set + '.ckpt')
+                self.saver.restore(self._sess, './ckpt/' + self._model_set + '.ckpt')
+            else:
+                print('============no checkpoints')
         self._nil_vars = set([self.A.name])  # , self.B.name])
 
     def _inference(self, stories, queries):
