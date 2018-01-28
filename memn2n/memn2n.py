@@ -18,10 +18,8 @@ def position_encoding(sentence_size, embedding_size):
     le = embedding_size+1
     for i in range(1, le):
         for j in range(1, ls):
-            encoding[i-1, j-1] = (i - (embedding_size+1)/2) * (j - (sentence_size+1)/2)
+            encoding[i-1, j-1] = (i - (le-1)/2) * (j - (ls-1)/2)
     encoding = 1 + 4 * encoding / embedding_size / sentence_size
-    # Make position encoding of time words identity to avoid modifying them 
-    encoding[:, -1] = 1.0
     return np.transpose(encoding)
 
 def zero_nil_slot(t, name=None):
@@ -31,11 +29,11 @@ def zero_nil_slot(t, name=None):
     The nil_slot is a dummy slot and should not be trained and influence
     the training algorithm.
     """
-    with tf.op_scope([t], name, "zero_nil_slot") as name:
+    with tf.name_scope(name, "zero_nil_slot", [t]) as name:
         t = tf.convert_to_tensor(t, name="t")
         s = tf.shape(t)[1]
-        z = tf.zeros(tf.stack([1, s]))
-        return tf.concat(axis=0, values=[z, tf.slice(t, [1, 0], [-1, -1])], name=name)
+        z = tf.zeros(tf.pack([1, s]))
+        return tf.concat(0, [z, tf.slice(t, [1, 0], [-1, -1])], name=name)
 
 def add_gradient_noise(t, stddev=1e-3, name=None):
     """
@@ -47,18 +45,27 @@ def add_gradient_noise(t, stddev=1e-3, name=None):
 
     0.001 was said to be a good fixed value for memory networks [2].
     """
-    with tf.op_scope([t, stddev], name, "add_gradient_noise") as name:
+    with tf.name_scope(name, "add_gradient_noise", [t, stddev]) as name:
         t = tf.convert_to_tensor(t, name="t")
         gn = tf.random_normal(tf.shape(t), stddev=stddev)
         return tf.add(t, gn, name=name)
 
+
 class MemN2N(object):
     """End-To-End Memory Network."""
-    def __init__(self, batch_size, vocab_size, sentence_size, memory_size, embedding_size,
+    def __init__(
+        self,
+        batch_size,
+        vocab_size,
+        sentence_size,
+        memory_size,
+        embedding_size,
+        answers,
         hops=3,
         max_grad_norm=40.0,
         nonlin=None,
         initializer=tf.random_normal_initializer(stddev=0.1),
+        optimizer=tf.train.AdamOptimizer(learning_rate=1e-2),
         encoding=position_encoding,
         session=tf.Session(),
         name='MemN2N'):
@@ -106,19 +113,28 @@ class MemN2N(object):
         self._max_grad_norm = max_grad_norm
         self._nonlin = nonlin
         self._init = initializer
+        self._opt = optimizer
         self._name = name
+        self._answers_one_hot = tf.pack(answers, name='answers_one_hot')
+        self._answer_vocab_size = self._answers_one_hot.get_shape()[0].value
+        self._sess = session
+        self.restore_model = False
 
         self._build_inputs()
         self._build_vars()
-
-        self._opt = tf.train.GradientDescentOptimizer(learning_rate=self._lr)
-
         self._encoding = tf.constant(encoding(self._sentence_size, self._embedding_size), name="encoding")
 
         # cross entropy
-        logits = self._inference(self._stories, self._queries) # (batch_size, vocab_size)
-        cross_entropy = tf.nn.softmax_cross_entropy_with_logits(logits=logits, labels=tf.cast(self._answers, tf.float32), name="cross_entropy")
-        cross_entropy_sum = tf.reduce_sum(cross_entropy, name="cross_entropy_sum")
+        logits = self._inference(self._stories, self._queries)  # (batch_size, answer_vocab_size)
+        cross_entropy = tf.nn.softmax_cross_entropy_with_logits(
+            logits,
+            tf.cast(self._answer_labels, tf.float32),
+            name="cross_entropy"
+        )
+        cross_entropy_sum = tf.reduce_sum(
+            cross_entropy,
+            name="cross_entropy_sum"
+        )
 
         # loss op
         loss_op = cross_entropy_sum
@@ -147,87 +163,70 @@ class MemN2N(object):
         self.predict_log_proba_op = predict_log_proba_op
         self.train_op = train_op
 
-        init_op = tf.global_variables_initializer()
-        self._sess = session
-        self._sess.run(init_op)
-
+        if not self.restore_model:
+            init_op = tf.global_variables_initializer()
+            self._sess.run(init_op)
 
     def _build_inputs(self):
         self._stories = tf.placeholder(tf.int32, [None, self._memory_size, self._sentence_size], name="stories")
         self._queries = tf.placeholder(tf.int32, [None, self._sentence_size], name="queries")
-        self._answers = tf.placeholder(tf.int32, [None, self._vocab_size], name="answers")
-        self._lr = tf.placeholder(tf.float32, [], name="learning_rate")
+        self._answer_labels = tf.placeholder(tf.int32, [None, self._answer_vocab_size], name="answer_labels")
 
     def _build_vars(self):
         with tf.variable_scope(self._name):
             nil_word_slot = tf.zeros([1, self._embedding_size])
-            A = tf.concat(axis=0, values=[ nil_word_slot, self._init([self._vocab_size-1, self._embedding_size]) ])
-            C = tf.concat(axis=0, values=[ nil_word_slot, self._init([self._vocab_size-1, self._embedding_size]) ])
+            A = tf.concat(0, [ nil_word_slot, self._init([self._vocab_size-1, self._embedding_size]) ])
+            # B = tf.concat(0, [ nil_word_slot, self._init([self._vocab_size-1, self._embedding_size]) ])
+            self.A = tf.Variable(A, name="A")
+            # self.B = tf.Variable(B, name="B")
 
-            self.A_1 = tf.Variable(A, name="A")
+            self.TA = tf.Variable(self._init([self._memory_size, self._embedding_size]), name='TA')
 
-            self.C = []
+            self.H = tf.Variable(self._init([self._embedding_size, self._embedding_size]), name="H")
+            self.W = tf.Variable(self._init([self._answer_vocab_size, self._embedding_size]), name="W")
 
-            for hopn in range(self._hops):
-                with tf.variable_scope('hop_{}'.format(hopn)):
-                    self.C.append(tf.Variable(C, name="C"))
-
-            # Dont use projection for layerwise weight sharing
-            # self.H = tf.Variable(self._init([self._embedding_size, self._embedding_size]), name="H")
-
-            # Use final C as replacement for W
-            # self.W = tf.Variable(self._init([self._embedding_size, self._vocab_size]), name="W")
-
-        self._nil_vars = set([self.A_1.name] + [x.name for x in self.C])
+            self.saver = tf.train.Saver()
+            # if tf.train.get_checkpoint_state('./ckpt/'):
+            #     self.restore_model = True
+            #     print('============found checkpoints. Load saved model!')
+            #     ckpt = tf.train.get_checkpoint_state('./ckpt/')
+            #     last_model = ckpt.model_checkpoint_path
+            #     self.saver.restore(self._sess, last_model)
+            # else:
+            #     print('============no checkpoints')
+        self._nil_vars = set([self.A.name])  # , self.B.name])
 
     def _inference(self, stories, queries):
         with tf.variable_scope(self._name):
-            # Use A_1 for thee question embedding as per Adjacent Weight Sharing
-            q_emb = tf.nn.embedding_lookup(self.A_1, queries)
+            # same embedding for stories and queries
+            q_emb = tf.nn.embedding_lookup(self.A, queries)
             u_0 = tf.reduce_sum(q_emb * self._encoding, 1)
             u = [u_0]
-
-            for hopn in range(self._hops):
-                if hopn == 0:
-                    m_emb_A = tf.nn.embedding_lookup(self.A_1, stories)
-                    m_A = tf.reduce_sum(m_emb_A * self._encoding, 2)
-
-                else:
-                    with tf.variable_scope('hop_{}'.format(hopn - 1)):
-                        m_emb_A = tf.nn.embedding_lookup(self.C[hopn - 1], stories)
-                        m_A = tf.reduce_sum(m_emb_A * self._encoding, 2)
-
+            for _ in range(self._hops):
+                m_emb = tf.nn.embedding_lookup(self.A, stories)
+                m = tf.reduce_sum(m_emb * self._encoding, 2) + self.TA
                 # hack to get around no reduce_dot
                 u_temp = tf.transpose(tf.expand_dims(u[-1], -1), [0, 2, 1])
-                dotted = tf.reduce_sum(m_A * u_temp, 2)
+                dotted = tf.reduce_sum(m * u_temp, 2)
 
                 # Calculate probabilities
                 probs = tf.nn.softmax(dotted)
 
                 probs_temp = tf.transpose(tf.expand_dims(probs, -1), [0, 2, 1])
-                with tf.variable_scope('hop_{}'.format(hopn)):
-                    m_emb_C = tf.nn.embedding_lookup(self.C[hopn], stories)
-                m_C = tf.reduce_sum(m_emb_C * self._encoding, 2)
-
-                c_temp = tf.transpose(m_C, [0, 2, 1])
+                c_temp = tf.transpose(m, [0, 2, 1])
                 o_k = tf.reduce_sum(c_temp * probs_temp, 2)
 
-                # Dont use projection layer for adj weight sharing
-                # u_k = tf.matmul(u[-1], self.H) + o_k
-
-                u_k = u[-1] + o_k
-
+                u_k = tf.matmul(u[-1], self.H) + o_k
                 # nonlinearity
                 if self._nonlin:
                     u_k = nonlin(u_k)
 
                 u.append(u_k)
+            a_emb = tf.nn.embedding_lookup(self.W, self._answers_one_hot)
+            a = tf.reduce_sum(a_emb * self._encoding, 1)
+            return tf.matmul(u_k, a, transpose_b=True)
 
-            # Use last C for output (transposed)
-            with tf.variable_scope('hop_{}'.format(self._hops)):
-                return tf.matmul(u_k, tf.transpose(self.C[-1], [1,0]))
-
-    def batch_fit(self, stories, queries, answers, learning_rate):
+    def batch_fit(self, stories, queries, answers):
         """Runs the training algorithm over the passed batch
 
         Args:
@@ -238,7 +237,7 @@ class MemN2N(object):
         Returns:
             loss: floating-point number, the loss computed for the batch
         """
-        feed_dict = {self._stories: stories, self._queries: queries, self._answers: answers, self._lr: learning_rate}
+        feed_dict = {self._stories: stories, self._queries: queries, self._answer_labels: answers}
         loss, _ = self._sess.run([self.loss_op, self.train_op], feed_dict=feed_dict)
         return loss
 
